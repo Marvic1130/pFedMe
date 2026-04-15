@@ -29,7 +29,7 @@ class Net(nn.Module):
         return output
 
 class Mclr_Logistic(nn.Module):
-    def __init__(self, input_dim = 784, output_dim = 10):
+    def __init__(self, input_dim = 60, output_dim = 50):
         super(Mclr_Logistic, self).__init__()
         self.fc1 = nn.Linear(input_dim, output_dim)
 
@@ -40,7 +40,7 @@ class Mclr_Logistic(nn.Module):
         return output
 
 class Mclr_CrossEntropy(nn.Module):
-    def __init__(self, input_dim = 784, output_dim = 10):
+    def __init__(self, input_dim = 60, output_dim = 50):
         super(Mclr_CrossEntropy, self).__init__()
         self.linear = torch.nn.Linear(input_dim, output_dim)
 
@@ -50,17 +50,19 @@ class Mclr_CrossEntropy(nn.Module):
         return outputs
 
 class DNN(nn.Module):
-    def __init__(self, input_dim = 784, mid_dim = 100, output_dim = 10):
+    def __init__(self, input_dim = 60, mid_dim = 256, output_dim = 50):
         super(DNN, self).__init__()
         # define network layers
         self.fc1 = nn.Linear(input_dim, mid_dim)
-        self.fc2 = nn.Linear(mid_dim, output_dim)
+        self.fc2 = nn.Linear(mid_dim, mid_dim)
+        self.fc3 = nn.Linear(mid_dim, output_dim)
         
     def forward(self, x):
         # define forward pass
         x = torch.flatten(x, 1)
         x = F.relu(self.fc1(x))
-        x = self.fc2(x)
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
         x = F.log_softmax(x, dim=1)
         return x
 
@@ -82,6 +84,29 @@ class CifarNet(nn.Module):
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return F.log_softmax(x, dim=1)
+
+class FemnistNet(nn.Module):
+    def __init__(self):
+        super(FemnistNet, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=5, padding=2)
+        self.pool1 = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=5, padding=2)
+        self.pool2 = nn.MaxPool2d(2, 2)
+        
+        self.fc1 = nn.Linear(64 * 7 * 7, 2048)
+        self.fc2 = nn.Linear(2048, 62)
+
+    def forward(self, x):
+        if x.dim() == 2:
+            x = x.view(-1, 1, 28, 28)
+            
+        x = self.pool1(F.relu(self.conv1(x)))
+        x = self.pool2(F.relu(self.conv2(x)))
+        x = x.view(-1, 64 * 7 * 7)
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        output = F.log_softmax(x, dim=1)
+        return output
 
 #################################
 ##### Neural Network model #####

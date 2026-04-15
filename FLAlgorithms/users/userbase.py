@@ -7,6 +7,15 @@ from torch.utils.data import DataLoader
 import numpy as np
 import copy
 
+
+def _is_cuda_device(device) -> bool:
+    try:
+        if isinstance(device, torch.device):
+            return device.type == "cuda"
+        return str(device).startswith("cuda")
+    except Exception:
+        return False
+
 class User:
     """
     Base class for users in federated learning.
@@ -23,10 +32,32 @@ class User:
         self.beta = beta
         self.lamda = lamda
         self.local_epochs = local_epochs
-        self.trainloader = DataLoader(train_data, self.batch_size)
-        self.testloader =  DataLoader(test_data, self.batch_size)
-        self.testloaderfull = DataLoader(test_data, self.test_samples)
-        self.trainloaderfull = DataLoader(train_data, self.train_samples)
+
+        self._pin_memory = bool(_is_cuda_device(self.device))
+        self.trainloader = DataLoader(
+            train_data,
+            self.batch_size,
+            shuffle=True,
+            drop_last=True,
+            pin_memory=self._pin_memory,
+        )
+        self.testloader = DataLoader(
+            test_data,
+            self.batch_size,
+            shuffle=True,
+            drop_last=True,
+            pin_memory=self._pin_memory,
+        )
+        # Ensure a positive batch size for the full test loader.
+        # Some clients may have zero test samples when using auto-selection/holdout routing.
+        # Torch DataLoader requires batch_size >= 1; using 1 yields an empty iterator for zero-length datasets.
+        full_test_bs = max(1, self.test_samples)
+        self.testloaderfull = DataLoader(
+            test_data, batch_size=full_test_bs, pin_memory=self._pin_memory
+        )
+        self.trainloaderfull = DataLoader(
+            train_data, self.train_samples, pin_memory=self._pin_memory
+        )
         self.iter_trainloader = iter(self.trainloader)
         self.iter_testloader = iter(self.testloader)
 
@@ -69,22 +100,31 @@ class User:
 
     def test(self):
         self.model.eval()
+        non_blocking = _is_cuda_device(self.device)
         test_acc = 0
+        loss_sum = 0.0
+        total_samples = 0
         for x, y in self.testloaderfull:
-            x, y = x.to(self.device), y.to(self.device)
+            x = x.to(self.device, non_blocking=non_blocking)
+            y = y.to(self.device, non_blocking=non_blocking)
             output = self.model(x)
+            batch_size = y.shape[0]
+            total_samples += batch_size
             test_acc += (torch.sum(torch.argmax(output, dim=1) == y)).item()
-            #@loss += self.loss(output, y)
-            #print(self.id + ", Test Accuracy:", test_acc / y.shape[0] )
-            #print(self.id + ", Test Loss:", loss)
-        return test_acc, y.shape[0]
+            loss_sum += self.loss(output, y).item() * batch_size
+        if total_samples == 0:
+            return 0, 0.0, 0
+        avg_loss = loss_sum / total_samples
+        return test_acc, avg_loss, total_samples
 
     def train_error_and_loss(self):
         self.model.eval()
+        non_blocking = _is_cuda_device(self.device)
         train_acc = 0
         loss = 0
         for x, y in self.trainloaderfull:
-            x, y = x.to(self.device), y.to(self.device)
+            x = x.to(self.device, non_blocking=non_blocking)
+            y = y.to(self.device, non_blocking=non_blocking)
             output = self.model(x)
             train_acc += (torch.sum(torch.argmax(output, dim=1) == y)).item()
             loss += self.loss(output, y)
@@ -94,25 +134,34 @@ class User:
     
     def test_persionalized_model(self):
         self.model.eval()
+        non_blocking = _is_cuda_device(self.device)
         test_acc = 0
+        loss_sum = 0.0
+        total_samples = 0
         self.update_parameters(self.persionalized_model_bar)
         for x, y in self.testloaderfull:
-            x, y = x.to(self.device), y.to(self.device)
+            x = x.to(self.device, non_blocking=non_blocking)
+            y = y.to(self.device, non_blocking=non_blocking)
             output = self.model(x)
+            batch_size = y.shape[0]
+            total_samples += batch_size
             test_acc += (torch.sum(torch.argmax(output, dim=1) == y)).item()
-            #@loss += self.loss(output, y)
-            #print(self.id + ", Test Accuracy:", test_acc / y.shape[0] )
-            #print(self.id + ", Test Loss:", loss)
+            loss_sum += self.loss(output, y).item() * batch_size
         self.update_parameters(self.local_model)
-        return test_acc, y.shape[0]
+        if total_samples == 0:
+            return 0, 0.0, 0
+        avg_loss = loss_sum / total_samples
+        return test_acc, avg_loss, total_samples
 
     def train_error_and_loss_persionalized_model(self):
         self.model.eval()
+        non_blocking = _is_cuda_device(self.device)
         train_acc = 0
         loss = 0
         self.update_parameters(self.persionalized_model_bar)
         for x, y in self.trainloaderfull:
-            x, y = x.to(self.device), y.to(self.device)
+            x = x.to(self.device, non_blocking=non_blocking)
+            y = y.to(self.device, non_blocking=non_blocking)
             output = self.model(x)
             train_acc += (torch.sum(torch.argmax(output, dim=1) == y)).item()
             loss += self.loss(output, y)
@@ -128,8 +177,42 @@ class User:
         except StopIteration:
             # restart the generator if the previous generator is exhausted.
             self.iter_trainloader = iter(self.trainloader)
-            (X, y) = next(self.iter_trainloader)
-        return (X.to(self.device), y.to(self.device))
+            try:
+                (X, y) = next(self.iter_trainloader)
+            except StopIteration:
+                # Loader is empty (likely due to drop_last=True with small dataset)
+                dataset_len = len(self.trainloader.dataset)
+                if dataset_len > 1:
+                    # Fallback: use dataset without drop_last (batch size will be dataset_len)
+                    # This is safe for BatchNorm since dataset_len > 1
+                    temp_loader = DataLoader(
+                        self.trainloader.dataset,
+                        batch_size=self.batch_size,
+                        shuffle=True,
+                        drop_last=False,
+                        pin_memory=self._pin_memory,
+                    )
+                    (X, y) = next(iter(temp_loader))
+                elif dataset_len == 1:
+                    # Single sample case. BatchNorm will fail with batch size 1.
+                    # Duplicate the sample to make batch size 2.
+                    temp_loader = DataLoader(
+                        self.trainloader.dataset,
+                        batch_size=1,
+                        shuffle=True,
+                        drop_last=False,
+                        pin_memory=self._pin_memory,
+                    )
+                    (X, y) = next(iter(temp_loader))
+                    X = torch.cat([X, X], dim=0)
+                    y = torch.cat([y, y], dim=0)
+                else:
+                    raise RuntimeError(f"Client {self.id} has no training data!")
+        non_blocking = _is_cuda_device(self.device)
+        return (
+            X.to(self.device, non_blocking=non_blocking),
+            y.to(self.device, non_blocking=non_blocking),
+        )
     
     def get_next_test_batch(self):
         try:
@@ -138,8 +221,34 @@ class User:
         except StopIteration:
             # restart the generator if the previous generator is exhausted.
             self.iter_testloader = iter(self.testloader)
-            (X, y) = next(self.iter_testloader)
-        return (X.to(self.device), y.to(self.device))
+            try:
+                (X, y) = next(self.iter_testloader)
+            except StopIteration:
+                # If still empty (e.g. dataset too small for drop_last=True), use full loader or handle gracefully
+                # For now, try to get from full loader or raise error if empty
+                if len(self.testloader) == 0 and len(self.testloader.dataset) > 0:
+                     # Fallback: create a loader without drop_last just for this batch if possible, 
+                     # or just return the whole dataset if it fits in memory (which is what testloaderfull does)
+                     # But we need a batch.
+                     # Let's try to get from trainloader as fallback? No, that's wrong.
+                     # If drop_last killed all data, we must allow a smaller batch or duplicate data.
+                     # Let's try to fetch from testloaderfull but take only batch_size
+                     loader = DataLoader(
+                         self.testloader.dataset,
+                         batch_size=self.batch_size,
+                         shuffle=True,
+                         drop_last=False,
+                         pin_memory=self._pin_memory,
+                     )
+                     self.iter_testloader = iter(loader)
+                     (X, y) = next(self.iter_testloader)
+                else:
+                     raise
+        non_blocking = _is_cuda_device(self.device)
+        return (
+            X.to(self.device, non_blocking=non_blocking),
+            y.to(self.device, non_blocking=non_blocking),
+        )
 
     def save_model(self):
         model_path = os.path.join("models", self.dataset)

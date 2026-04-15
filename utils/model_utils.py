@@ -286,6 +286,14 @@ def read_data(dataset):
         test_data.update(cdata['user_data'])
 
     clients = list(sorted(train_data.keys()))
+    
+    # Limit to 100 clients if dataset is femnist
+    if dataset == "femnist" and len(clients) > 100:
+        print(f"Limiting clients from {len(clients)} to 100")
+        clients = clients[:100]
+        # Filter data
+        train_data = {k: v for k, v in train_data.items() if k in clients}
+        test_data = {k: v for k, v in test_data.items() if k in clients}
 
     return clients, groups, train_data, test_data
 

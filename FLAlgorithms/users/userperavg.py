@@ -36,9 +36,6 @@ class UserPerAvg(User):
     def train(self, epochs):
         LOSS = 0
         self.model.train()
-    def train(self, epochs):
-        LOSS = 0
-        self.model.train()
         for epoch in range(1, self.local_epochs + 1):  # local update 
             self.model.train()
 
